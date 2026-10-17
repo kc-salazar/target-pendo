@@ -1,0 +1,28 @@
+{
+  "integration_key": "replace-with-a-pendo-integration-key",
+  "base_url": "https://app.pendo.io",
+  "batch_size_rows": 1000,
+  "max_batch_bytes": 3000000,
+  "max_parallelism": 4,
+  "streams": {
+    "warehouse_visitors": {
+      "kind": "visitor",
+      "group": "custom",
+      "id_field": "user_id",
+      "create_missing": false,
+      "field_mappings": {
+        "planName": "plan_name",
+        "country": "/profile/country"
+      }
+    },
+    "warehouse_accounts": {
+      "kind": "account",
+      "group": "custom",
+      "id_field": "account_id",
+      "field_mappings": {
+        "accountTier": "account_tier",
+        "employeeCount": "employee_count"
+      }
+    }
+  }
+}
