@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
@@ -13,30 +14,47 @@ Kind = Literal["visitor", "account"]
 FieldGroup = Literal["agent", "custom"]
 
 
-def _resolve_json_pointer(document: Mapping[str, Any], pointer: str) -> Any:
-    if pointer == "":
-        return document
+@dataclass(frozen=True, slots=True)
+class Selector:
+    """A source-field selector compiled once per stream instead of once per record."""
 
-    current: Any = document
-    for raw_token in pointer[1:].split("/"):
-        token = raw_token.replace("~1", "/").replace("~0", "~")
-        if isinstance(current, Mapping) and token in current:
-            current = current[token]
-        elif isinstance(current, list) and token.isdigit() and int(token) < len(current):
-            current = current[int(token)]
-        else:
-            return _MISSING
-    return current
+    raw: str
+    tokens: tuple[str, ...] | None
+
+    @classmethod
+    def compile(cls, selector: str) -> Selector:
+        if not (selector.startswith("/") or selector == ""):
+            return cls(raw=selector, tokens=None)
+        if re.search(r"~(?![01])", selector):
+            raise ConfigurationError(f"Invalid JSON Pointer selector: {selector!r}")
+        tokens = tuple(
+            token.replace("~1", "/").replace("~0", "~") for token in selector[1:].split("/")
+        )
+        return cls(raw=selector, tokens=() if selector == "" else tokens)
+
+    def resolve(self, document: Mapping[str, Any]) -> Any:
+        if self.tokens is None:
+            return document.get(self.raw, _MISSING)
+        if not self.tokens:
+            return document
+
+        current: Any = document
+        for token in self.tokens:
+            if isinstance(current, Mapping) and token in current:
+                current = current[token]
+            elif isinstance(current, list) and token.isdigit() and int(token) < len(current):
+                current = current[int(token)]
+            else:
+                return _MISSING
+        return current
 
 
 def resolve_selector(record: Mapping[str, Any], selector: str) -> Any:
     """Resolve a top-level key or RFC 6901 JSON Pointer."""
-    if selector.startswith("/") or selector == "":
-        return _resolve_json_pointer(record, selector)
-    return record.get(selector, _MISSING)
+    return Selector.compile(selector).resolve(record)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class StreamMapping:
     """Validated mapping configuration for one Singer stream."""
 
@@ -50,6 +68,8 @@ class StreamMapping:
     missing_field_behavior: Literal["fail", "omit"]
     null_value_behavior: Literal["fail", "omit", "send"]
     empty_values_behavior: Literal["fail", "skip"]
+    id_selector: Selector
+    field_selectors: tuple[tuple[str, Selector], ...]
 
     @classmethod
     def from_config(
@@ -121,6 +141,11 @@ class StreamMapping:
             missing_field_behavior=cast("Literal['fail', 'omit']", missing_field_behavior),
             null_value_behavior=cast("Literal['fail', 'omit', 'send']", null_value_behavior),
             empty_values_behavior=cast("Literal['fail', 'skip']", empty_values_behavior),
+            id_selector=Selector.compile(id_field),
+            field_selectors=tuple(
+                (pendo_field, Selector.compile(selector))
+                for pendo_field, selector in field_mappings.items()
+            ),
         )
 
     @property
@@ -130,7 +155,7 @@ class StreamMapping:
 
     def map_record(self, record: Mapping[str, Any]) -> dict[str, Any] | None:
         """Convert a Singer record into one Pendo bulk-update item."""
-        source_id = resolve_selector(record, self.id_field)
+        source_id = self.id_selector.resolve(record)
         if source_id is _MISSING or source_id is None or str(source_id).strip() == "":
             if self.missing_id_behavior == "skip":
                 return None
@@ -140,20 +165,20 @@ class StreamMapping:
             )
 
         values: dict[str, Any] = {}
-        for pendo_field, selector in self.field_mappings.items():
-            value = resolve_selector(record, selector)
+        for pendo_field, selector in self.field_selectors:
+            value = selector.resolve(record)
             if value is _MISSING:
                 if self.missing_field_behavior == "fail":
                     raise RecordMappingError(
                         f"Stream {self.stream_name!r} record is missing selector "
-                        f"{selector!r} for Pendo field {pendo_field!r}"
+                        f"{selector.raw!r} for Pendo field {pendo_field!r}"
                     )
                 continue
             if value is None:
                 if self.null_value_behavior == "fail":
                     raise RecordMappingError(
                         f"Stream {self.stream_name!r} record has null at selector "
-                        f"{selector!r} for Pendo field {pendo_field!r}"
+                        f"{selector.raw!r} for Pendo field {pendo_field!r}"
                     )
                 if self.null_value_behavior == "omit":
                     continue
@@ -167,3 +192,49 @@ class StreamMapping:
             )
 
         return {self.pendo_id_key: str(source_id), "values": values}
+
+
+@dataclass(frozen=True, slots=True)
+class MappedRecords:
+    """Mapped records plus accounting for records not sent separately."""
+
+    records: list[dict[str, Any]]
+    skipped: int
+    duplicates: int
+
+
+def map_and_coalesce_records(
+    source_records: Sequence[Mapping[str, Any]],
+    mapping: StreamMapping,
+    *,
+    deduplicate: bool,
+) -> MappedRecords:
+    """Map a Singer buffer and optionally coalesce updates for the same Pendo ID."""
+    mapped_records: list[dict[str, Any]] = []
+    skipped = 0
+    duplicates = 0
+    positions: dict[str, int] = {}
+
+    for record in source_records:
+        mapped = mapping.map_record(record)
+        if mapped is None:
+            skipped += 1
+            continue
+        if not deduplicate:
+            mapped_records.append(mapped)
+            continue
+
+        pendo_id = str(mapped[mapping.pendo_id_key])
+        existing_position = positions.get(pendo_id)
+        if existing_position is None:
+            positions[pendo_id] = len(mapped_records)
+            mapped_records.append(mapped)
+            continue
+
+        existing = mapped_records[existing_position]
+        existing_values = cast("dict[str, Any]", existing["values"])
+        mapped_values = cast("dict[str, Any]", mapped["values"])
+        existing_values.update(mapped_values)
+        duplicates += 1
+
+    return MappedRecords(mapped_records, skipped, duplicates)

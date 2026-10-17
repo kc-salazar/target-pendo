@@ -1,0 +1,63 @@
+{
+  "benchmark": "mapping, duplicate coalescing, JSON encoding, and bounded scheduling with simulated fixed-latency bulk requests; no Pendo traffic",
+  "python": "3.12.13",
+  "platform": "Windows-11-10.0.22000-SP0",
+  "parameters": {
+    "records": 50000,
+    "fields_per_record": 8,
+    "request_batch_size": 2500,
+    "max_batch_bytes": 3000000,
+    "simulated_latency_ms": 100.0,
+    "repeats": 3
+  },
+  "results": [
+    {
+      "concurrency": 1,
+      "median_seconds": 2.61468,
+      "records_per_second": 19122.8,
+      "requests": 20,
+      "max_active_requests": 1,
+      "speedup_vs_serial": 1.0
+    },
+    {
+      "concurrency": 2,
+      "median_seconds": 1.519316,
+      "records_per_second": 32909.5,
+      "requests": 20,
+      "max_active_requests": 2,
+      "speedup_vs_serial": 1.72
+    },
+    {
+      "concurrency": 4,
+      "median_seconds": 1.027372,
+      "records_per_second": 48667.8,
+      "requests": 20,
+      "max_active_requests": 4,
+      "speedup_vs_serial": 2.55
+    },
+    {
+      "concurrency": 8,
+      "median_seconds": 0.785648,
+      "records_per_second": 63641.7,
+      "requests": 20,
+      "max_active_requests": 8,
+      "speedup_vs_serial": 3.33
+    },
+    {
+      "concurrency": 16,
+      "median_seconds": 0.674581,
+      "records_per_second": 74120.1,
+      "requests": 20,
+      "max_active_requests": 13,
+      "speedup_vs_serial": 3.88
+    },
+    {
+      "concurrency": 32,
+      "median_seconds": 0.695995,
+      "records_per_second": 71839.6,
+      "requests": 20,
+      "max_active_requests": 14,
+      "speedup_vs_serial": 3.76
+    }
+  ]
+}

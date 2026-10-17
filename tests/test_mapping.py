@@ -46,6 +46,11 @@ def test_missing_or_invalid_array_pointer_returns_missing() -> None:
     }
 
 
+def test_invalid_json_pointer_escape_is_rejected_during_configuration() -> None:
+    with pytest.raises(ConfigurationError, match="Invalid JSON Pointer"):
+        make_mapping(field_mappings={"bad": "/profile/~2bad"})
+
+
 def test_map_visitor_record_with_nested_value() -> None:
     mapping = make_mapping(create_missing=True)
 

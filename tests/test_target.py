@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import io
 import json
-from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar
 
 import pytest
 
+from target_pendo.batching import JsonBatch
 from target_pendo.client import PendoBulkResult
 from target_pendo.exceptions import ConfigurationError, PendoAPIError
 from target_pendo.sink import PendoSink
@@ -54,22 +54,22 @@ class RecordingClient:
         *,
         kind: str,
         group: str,
-        records: Sequence[Mapping[str, Any]],
+        batch: JsonBatch,
         create_missing: bool,
     ) -> PendoBulkResult:
         self.calls.append(
             {
                 "kind": kind,
                 "group": group,
-                "records": [dict(record) for record in records],
+                "records": [dict(record) for record in batch.records],
                 "create_missing": create_missing,
             }
         )
         if self.error:
             raise self.error
         return PendoBulkResult(
-            total=len(records),
-            updated=len(records),
+            total=len(batch),
+            updated=len(batch),
             failed=0,
             kind=kind,
         )
@@ -136,7 +136,7 @@ def test_sink_splits_mapped_records_by_configured_request_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("target_pendo.sink.PendoClient", RecordingClient)
-    target = TargetPendo(config=target_config(batch_size_rows=2))
+    target = TargetPendo(config=target_config(request_batch_size_rows=2))
     sink = target.add_sink("users", schema(), ["id"])
 
     sink.process_batch(
@@ -150,7 +150,60 @@ def test_sink_splits_mapped_records_by_configured_request_limit(
     )
     sink.clean_up()
 
-    assert [len(call["records"]) for call in RecordingClient.instances[0].calls] == [2, 1]
+    assert sorted(len(call["records"]) for call in RecordingClient.instances[0].calls) == [1, 2]
+
+
+def test_sink_coalesces_duplicate_ids_before_sending(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("target_pendo.sink.PendoClient", RecordingClient)
+    target = TargetPendo(config=target_config())
+    sink = target.add_sink("users", schema(), ["id"])
+
+    sink.process_batch(
+        {
+            "records": [
+                {"id": "u1", "plan": "one"},
+                {"id": "u1", "plan": "two"},
+            ]
+        }
+    )
+    sink.clean_up()
+
+    assert RecordingClient.instances[0].calls[0]["records"] == [
+        {"visitorId": "u1", "values": {"planName": "two"}}
+    ]
+
+
+def test_duplicate_coalescing_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("target_pendo.sink.PendoClient", RecordingClient)
+    target = TargetPendo(config=target_config(deduplicate_records=False))
+    sink = target.add_sink("users", schema(), ["id"])
+
+    sink.process_batch(
+        {
+            "records": [
+                {"id": "u1", "plan": "one"},
+                {"id": "u1", "plan": "two"},
+            ]
+        }
+    )
+    sink.clean_up()
+
+    assert RecordingClient.instances[0].calls[0]["records"] == [
+        {"visitorId": "u1", "values": {"planName": "one"}},
+        {"visitorId": "u1", "values": {"planName": "two"}},
+    ]
+
+
+def test_performance_defaults_are_applied() -> None:
+    config = target_config()
+    config.pop("batch_size_rows")
+    target = TargetPendo(config=config)
+
+    assert target.config["batch_size_rows"] == 50_000
+    assert target.config["request_batch_size_rows"] == 2_500
+    assert target.config["request_concurrency"] == 8
+    assert target.config["http2"] is True
+    assert target.config["deduplicate_records"] is True
 
 
 def test_target_uses_configured_parallelism_and_sink_class() -> None:

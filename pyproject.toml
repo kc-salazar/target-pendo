@@ -14,7 +14,7 @@ authors = [
 ]
 keywords = ["singer", "meltano", "pendo", "etl", "elt"]
 classifiers = [
-  "Development Status :: 4 - Beta",
+  "Development Status :: 3 - Alpha",
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
@@ -24,9 +24,15 @@ classifiers = [
   "Topic :: Database",
 ]
 dependencies = [
-  "httpx>=0.28.1,<0.29",
+  "httpx[http2]>=0.28.1,<0.29",
+  "python-rapidjson>=1.25,<2",
   "singer-sdk==0.54.8",
 ]
+
+[project.urls]
+Homepage = "https://github.com/kc-salazar/target-pendo"
+Repository = "https://github.com/kc-salazar/target-pendo"
+Issues = "https://github.com/kc-salazar/target-pendo/issues"
 
 [project.scripts]
 target-pendo = "target_pendo.target:TargetPendo.cli"

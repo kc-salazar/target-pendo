@@ -5,8 +5,10 @@ from __future__ import annotations
 import email.utils
 import logging
 import random
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -14,14 +16,14 @@ from typing import Any
 import httpx
 
 from target_pendo import __version__
-from target_pendo.batching import encode_json
+from target_pendo.batching import JsonBatch, make_json_batch
 from target_pendo.exceptions import (
     PendoAPIError,
     PendoPartialFailureError,
     PendoProtocolError,
 )
 
-_RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
+_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,9 @@ class PendoClient:
         max_retries: int,
         backoff_base_seconds: float,
         backoff_max_seconds: float,
+        http2: bool = True,
+        max_connections: int = 8,
+        request_limiter: threading.BoundedSemaphore | None = None,
         transport: httpx.BaseTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
         uniform: Callable[[float, float], float] = random.uniform,
@@ -75,12 +80,17 @@ class PendoClient:
             raise ValueError("request_timeout_seconds must be positive")
         if max_retries < 0:
             raise ValueError("max_retries must not be negative")
+        if backoff_base_seconds < 0 or backoff_max_seconds < 0:
+            raise ValueError("backoff values must not be negative")
+        if max_connections < 1:
+            raise ValueError("max_connections must be at least 1")
 
         self.max_retries = max_retries
         self.backoff_base_seconds = backoff_base_seconds
         self.backoff_max_seconds = backoff_max_seconds
         self._sleep = sleep
         self._uniform = uniform
+        self._request_limiter = request_limiter
         self.logger = logger or logging.getLogger(__name__)
         timeout = httpx.Timeout(
             connect=min(30.0, request_timeout_seconds),
@@ -97,6 +107,11 @@ class PendoClient:
                 "X-Pendo-Integration-Key": integration_key,
             },
             timeout=timeout,
+            http2=http2,
+            limits=httpx.Limits(
+                max_connections=max_connections,
+                max_keepalive_connections=max_connections,
+            ),
             transport=transport,
         )
 
@@ -115,19 +130,25 @@ class PendoClient:
         *,
         kind: str,
         group: str,
-        records: Sequence[Mapping[str, Any]],
+        batch: JsonBatch | None = None,
+        records: Sequence[Mapping[str, Any]] | None = None,
         create_missing: bool,
     ) -> PendoBulkResult:
         """Write one validated bulk metadata request."""
-        if not records:
+        if batch is not None and records is not None:
+            raise ValueError("pass either batch or records, not both")
+        if batch is None:
+            batch = make_json_batch(records or ())
+        if not batch.records:
             raise ValueError("records must not be empty")
         path = f"/api/v1/metadata/{kind}/{group}/value"
-        content = encode_json(list(records))
         params = {"create": "true"} if create_missing else None
 
         for attempt in range(self.max_retries + 1):
             try:
-                response = self._client.post(path, params=params, content=content)
+                limiter = self._request_limiter or nullcontext()
+                with limiter:
+                    response = self._client.post(path, params=params, content=batch.content)
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 if attempt >= self.max_retries:
                     raise PendoAPIError(0, f"request failed after {attempt + 1} attempts") from exc
@@ -149,7 +170,7 @@ class PendoClient:
             if not response.is_success:
                 raise PendoAPIError(response.status_code, self._safe_error_summary(response))
 
-            return self._parse_result(response, expected_kind=kind, expected_total=len(records))
+            return self._parse_result(response, expected_kind=kind, expected_total=len(batch))
 
         raise AssertionError("unreachable")
 

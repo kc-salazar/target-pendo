@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Mapping
 from typing import Any, ClassVar
 
@@ -75,7 +76,12 @@ class TargetPendo(Target):
             "batch_size_rows": {
                 "type": "integer",
                 "minimum": 1,
-                "default": 1_000,
+                "default": 50_000,
+            },
+            "request_batch_size_rows": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 2_500,
             },
             "max_batch_bytes": {
                 "type": "integer",
@@ -108,6 +114,14 @@ class TargetPendo(Target):
                 "maximum": 8,
                 "default": 4,
             },
+            "request_concurrency": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 64,
+                "default": 8,
+            },
+            "http2": {"type": "boolean", "default": True},
+            "deduplicate_records": {"type": "boolean", "default": True},
             "validate_records": {"type": "boolean", "default": True},
         },
     }
@@ -116,6 +130,9 @@ class TargetPendo(Target):
         super().__init__(*args, **kwargs)
         self._validate_streams()
         self.max_parallelism = int(self.config.get("max_parallelism", 4))
+        self.request_limiter = threading.BoundedSemaphore(
+            int(self.config.get("request_concurrency", 8))
+        )
 
     def _validate_streams(self) -> None:
         streams = self.config.get("streams")

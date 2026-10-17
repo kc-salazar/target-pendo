@@ -19,8 +19,13 @@ jobs:
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
-      - run: uv sync --all-groups
+      - run: uv sync --locked --all-groups
       - run: uv run pytest
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run mypy
+      - run: uv build
+      - run: >-
+          uv run python benchmarks/benchmark_throughput.py
+          --records 1000 --request-batch-size 100 --latency-ms 0
+          --concurrency 1 2 --repeats 1

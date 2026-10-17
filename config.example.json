@@ -1,9 +1,13 @@
 {
   "integration_key": "replace-with-a-pendo-integration-key",
   "base_url": "https://app.pendo.io",
-  "batch_size_rows": 1000,
+  "batch_size_rows": 50000,
+  "request_batch_size_rows": 2500,
   "max_batch_bytes": 3000000,
+  "request_concurrency": 8,
   "max_parallelism": 4,
+  "http2": true,
+  "deduplicate_records": true,
   "streams": {
     "warehouse_visitors": {
       "kind": "visitor",

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 import pytest
 
+from target_pendo.batching import make_json_batch
 from target_pendo.client import PendoBulkResult, PendoClient, _retry_after_seconds
 from target_pendo.exceptions import (
     PendoAPIError,
@@ -196,7 +200,7 @@ def test_non_retryable_error_is_sanitized_and_not_retried() -> None:
     assert attempts == 1
 
 
-@pytest.mark.parametrize("status", [408, 429, 500, 502, 503, 504])
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
 def test_retryable_status_fails_after_retry_limit(status: int) -> None:
     transport = httpx.MockTransport(lambda _: httpx.Response(status))
 
@@ -212,6 +216,23 @@ def test_retryable_status_fails_after_retry_limit(status: int) -> None:
         )
 
     assert error.value.status_code == status
+
+
+def test_timeout_is_returned_to_writer_for_adaptive_split() -> None:
+    transport = httpx.MockTransport(lambda _: httpx.Response(408))
+
+    with (
+        make_client(transport, max_retries=2) as client,
+        pytest.raises(PendoAPIError, match="HTTP 408") as error,
+    ):
+        client.update_metadata(
+            kind="visitor",
+            group="custom",
+            records=[{"visitorId": "u1", "values": {"plan": "Pro"}}],
+            create_missing=False,
+        )
+
+    assert error.value.status_code == 408
 
 
 def test_transport_error_fails_after_retry_limit() -> None:
@@ -299,12 +320,77 @@ def test_empty_request_is_rejected_before_http() -> None:
         )
 
 
+def test_preencoded_batch_and_records_are_mutually_exclusive() -> None:
+    transport = httpx.MockTransport(lambda _: pytest.fail("HTTP should not be called"))
+    with (
+        make_client(transport) as client,
+        pytest.raises(ValueError, match="either batch or records"),
+    ):
+        client.update_metadata(
+            kind="visitor",
+            group="custom",
+            batch=make_json_batch([{"visitorId": "u1", "values": {"plan": "Pro"}}]),
+            records=[{"visitorId": "u1", "values": {"plan": "Pro"}}],
+            create_missing=False,
+        )
+
+
+def test_global_request_limiter_bounds_parallel_http_calls() -> None:
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.02)
+        with lock:
+            active -= 1
+        return httpx.Response(200, json=response_payload())
+
+    client = PendoClient(
+        integration_key="key",
+        base_url="https://app.pendo.io",
+        request_timeout_seconds=1,
+        max_retries=0,
+        backoff_base_seconds=0,
+        backoff_max_seconds=0,
+        max_connections=8,
+        request_limiter=threading.BoundedSemaphore(2),
+        transport=httpx.MockTransport(handler),
+    )
+    batch = make_json_batch([{"visitorId": "u1", "values": {"plan": "Pro"}}])
+    try:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(
+                executor.map(
+                    lambda _: client.update_metadata(
+                        kind="visitor",
+                        group="custom",
+                        batch=batch,
+                        create_missing=False,
+                    ),
+                    range(8),
+                )
+            )
+    finally:
+        client.close()
+
+    assert len(results) == 8
+    assert max_active == 2
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
         ({"integration_key": ""}, "integration_key"),
         ({"request_timeout_seconds": 0}, "request_timeout_seconds"),
         ({"max_retries": -1}, "max_retries"),
+        ({"backoff_base_seconds": -1}, "backoff"),
+        ({"backoff_max_seconds": -1}, "backoff"),
+        ({"max_connections": 0}, "max_connections"),
     ],
 )
 def test_invalid_client_configuration(kwargs: dict[str, Any], message: str) -> None:
